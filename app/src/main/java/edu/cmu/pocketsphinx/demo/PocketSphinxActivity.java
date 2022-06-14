@@ -8,6 +8,7 @@ import android.os.Bundle;
 import android.support.annotation.NonNull;
 import android.support.v4.app.ActivityCompat;
 import android.support.v4.content.ContextCompat;
+import android.util.Log;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -24,7 +25,12 @@ import edu.cmu.pocketsphinx.SpeechRecognizerSetup;
 
 import static android.widget.Toast.makeText;
 
+/// CMU Sphinx适合写好固定关键词后识别
+/// vosk kaldi不需要提前预设关键词识别，更有普适性
+/// 这两者都是通过AudioRecord录音，提取对应的buffer放入模型从而识别是什么文字，提取录音buffer的过程是一样的。
+/// 所以如果我们要做"App录音并把录音发送到后台识别"，可以参考SpeechRecognizer.java的RecognizerThread线程的录音源码
 public class PocketSphinxActivity extends Activity implements RecognitionListener {
+    private static final String TAG = PocketSphinxActivity.class.getSimpleName();
     /* Named searches allow to quickly reconfigure the decoder */
     private static final String KWS_SEARCH = "wakeup";
     private static final String FORECAST_SEARCH = "forecast";
@@ -46,15 +52,7 @@ public class PocketSphinxActivity extends Activity implements RecognitionListene
         super.onCreate(state);
 
         setContentView(R.layout.main);
-        ((TextView) findViewById(R.id.caption_text))
-                .setText("Preparing the recognizer");
-
-        // Check if user has given permission to record audio
-        int permissionCheck = ContextCompat.checkSelfPermission(getApplicationContext(), Manifest.permission.RECORD_AUDIO);
-        if (permissionCheck != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.RECORD_AUDIO}, PERMISSIONS_REQUEST_RECORD_AUDIO);
-            return;
-        }
+        ((TextView) findViewById(R.id.caption_text)).setText("Preparing the recognizer");
 
         // Prepare the data for UI
         captions = new HashMap<>();
@@ -63,6 +61,14 @@ public class PocketSphinxActivity extends Activity implements RecognitionListene
         captions.put(DIGITS_SEARCH, R.string.digits_caption);
         captions.put(PHONE_SEARCH, R.string.phone_caption);
         captions.put(FORECAST_SEARCH, R.string.forecast_caption);
+
+        // Check if user has given permission to record audio
+        int permissionCheck = ContextCompat.checkSelfPermission(getApplicationContext(), Manifest.permission.RECORD_AUDIO);
+        if (permissionCheck != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.RECORD_AUDIO}, PERMISSIONS_REQUEST_RECORD_AUDIO);
+            return;
+        }
+
         // Recognizer initialization is a time-consuming and it involves IO,
         // so we execute it in async task
         new SetupTask(this).execute();
@@ -91,6 +97,33 @@ public class PocketSphinxActivity extends Activity implements RecognitionListene
         }
     }
 
+    @Override
+    public void onBeginningOfSpeech() {
+        Log.d(TAG, "onBeginningOfSpeech 检测到有人说话，开始录音");
+    }
+
+    /**
+     * We stop recognizer here to get a final result
+     */
+    @Override
+    public void onEndOfSpeech() {
+        Log.d(TAG, "onEndOfSpeech 检测到没人说话了，停止录音");
+        if (!recognizer.getSearchName().equals(KWS_SEARCH))
+            switchSearch(KWS_SEARCH);
+    }
+
+    @Override
+    public void onError(Exception error) {
+        Log.d(TAG, "onError:" + error.getMessage());
+        ((TextView) findViewById(R.id.caption_text)).setText(error.getMessage());
+    }
+
+    @Override
+    public void onTimeout() {
+        Log.d(TAG, "onTimeout");
+        switchSearch(KWS_SEARCH);
+    }
+
     /**
      * In partial result we get quick updates about current hypothesis. In
      * keyword spotting mode we can react here, in other modes we need to wait
@@ -98,9 +131,9 @@ public class PocketSphinxActivity extends Activity implements RecognitionListene
      */
     @Override
     public void onPartialResult(Hypothesis hypothesis) {
+        Log.d(TAG, "onPartialResult 语音不断检测，无论是否检测到录音，都会一直运行，如果检测到录音开始和结束，会把该部分的buffer放入检测");
         if (hypothesis == null)
             return;
-
         String text = hypothesis.getHypstr();
         if (text.equals(KEYPHRASE))
             switchSearch(MENU_SEARCH);
@@ -119,24 +152,12 @@ public class PocketSphinxActivity extends Activity implements RecognitionListene
      */
     @Override
     public void onResult(Hypothesis hypothesis) {
+        Log.d(TAG, "onResult 经过onPartialResult不断检测，匹配到关键词后回调onResult");
         ((TextView) findViewById(R.id.result_text)).setText("");
         if (hypothesis != null) {
             String text = hypothesis.getHypstr();
             makeText(getApplicationContext(), text, Toast.LENGTH_SHORT).show();
         }
-    }
-
-    @Override
-    public void onBeginningOfSpeech() {
-    }
-
-    /**
-     * We stop recognizer here to get a final result
-     */
-    @Override
-    public void onEndOfSpeech() {
-        if (!recognizer.getSearchName().equals(KWS_SEARCH))
-            switchSearch(KWS_SEARCH);
     }
 
     private void switchSearch(String searchName) {
@@ -150,6 +171,35 @@ public class PocketSphinxActivity extends Activity implements RecognitionListene
 
         String caption = getResources().getString(captions.get(searchName));
         ((TextView) findViewById(R.id.caption_text)).setText(caption);
+    }
+
+    private static class SetupTask extends AsyncTask<Void, Void, Exception> {
+        WeakReference<PocketSphinxActivity> activityReference;
+
+        SetupTask(PocketSphinxActivity activity) {
+            this.activityReference = new WeakReference<>(activity);
+        }
+
+        @Override
+        protected Exception doInBackground(Void... params) {
+            try {
+                Assets assets = new Assets(activityReference.get());
+                File assetDir = assets.syncAssets();
+                activityReference.get().setupRecognizer(assetDir);
+            } catch (IOException e) {
+                return e;
+            }
+            return null;
+        }
+
+        @Override
+        protected void onPostExecute(Exception result) {
+            if (result != null) {
+                ((TextView) activityReference.get().findViewById(R.id.caption_text)).setText("Failed to init recognizer " + result);
+            } else {
+                activityReference.get().switchSearch(KWS_SEARCH);
+            }
+        }
     }
 
     private void setupRecognizer(File assetsDir) throws IOException {
@@ -187,45 +237,5 @@ public class PocketSphinxActivity extends Activity implements RecognitionListene
         // Phonetic search
         File phoneticModel = new File(assetsDir, "en-phone.dmp");
         recognizer.addAllphoneSearch(PHONE_SEARCH, phoneticModel);
-    }
-
-    @Override
-    public void onError(Exception error) {
-        ((TextView) findViewById(R.id.caption_text)).setText(error.getMessage());
-    }
-
-    @Override
-    public void onTimeout() {
-        switchSearch(KWS_SEARCH);
-    }
-
-    private static class SetupTask extends AsyncTask<Void, Void, Exception> {
-        WeakReference<PocketSphinxActivity> activityReference;
-
-        SetupTask(PocketSphinxActivity activity) {
-            this.activityReference = new WeakReference<>(activity);
-        }
-
-        @Override
-        protected Exception doInBackground(Void... params) {
-            try {
-                Assets assets = new Assets(activityReference.get());
-                File assetDir = assets.syncAssets();
-                activityReference.get().setupRecognizer(assetDir);
-            } catch (IOException e) {
-                return e;
-            }
-            return null;
-        }
-
-        @Override
-        protected void onPostExecute(Exception result) {
-            if (result != null) {
-                ((TextView) activityReference.get().findViewById(R.id.caption_text))
-                        .setText("Failed to init recognizer " + result);
-            } else {
-                activityReference.get().switchSearch(KWS_SEARCH);
-            }
-        }
     }
 }
